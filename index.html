@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>School tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,680&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Concordia · Computer Engineering · 2026–27 sequence</p>
+      <h1>Where you are, and what’s left</h1>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <section class="toolbar">
+    <div class="paths" id="paths"></div>
+    <p class="path-note" id="path-note"></p>
+    <div class="tools">
+      <input id="search" type="search" placeholder="Search a code or a name" />
+      <div class="filters" id="filters">
+        <button data-filter="left" class="on">Still left</button>
+        <button data-filter="doing">Doing</button>
+        <button data-filter="done">Done</button>
+        <button data-filter="all">All</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="natsci"></section>
+  <main id="board"></main>
+
+  <aside id="drawer" hidden>
+    <div class="drawer-card" id="drawer-card"></div>
+  </aside>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
