@@ -77,6 +77,24 @@ h1 { font-size: clamp(48px, 8vw, 92px); }
   box-shadow: 0 8px 24px rgba(40, 20, 10, 0.06);
 }
 .google:hover { border-color: #c8c8c8; }
+.sync-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 12px 16px 0;
+  padding: 12px 14px;
+  background: var(--amber-bg);
+  border-radius: 16px;
+}
+.scene .sync-banner { margin: 0 0 18px; }
+.danger {
+  border: 1px solid var(--maroon);
+  color: var(--maroon);
+  background: var(--maroon-soft);
+  border-radius: 999px;
+  padding: 8px 14px;
+}
 .gmark { width: 22px; height: 22px; }
 
 .field {
@@ -402,7 +420,7 @@ a.primary.link-btn { color: #fff; }
     background: rgba(243, 238, 230, 0.96);
     border-bottom: 1px solid var(--line);
   }
-  .menu-toggle, .nav-item, .primary, .ghost, .chip, .mini, .card-x, .add-term-open, .status button, .uni-option, .guide-pick, .link-btn {
+  .menu-toggle, .nav-item, .primary, .ghost, .danger, .chip, .mini, .card-x, .add-term-open, .status button, .uni-option, .guide-pick, .link-btn {
     min-height: 44px;
   }
   .menu-toggle {

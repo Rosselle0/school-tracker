@@ -52,7 +52,7 @@ const server = http.createServer(async (req, res) => {
     auth.searchParams.set("client_id", secrets.clientId);
     auth.searchParams.set("redirect_uri", redirectUri);
     auth.searchParams.set("response_type", "code");
-    auth.searchParams.set("scope", "openid email profile");
+    auth.searchParams.set("scope", "openid email profile https://www.googleapis.com/auth/drive.appdata");
     auth.searchParams.set("state", state);
     auth.searchParams.set("access_type", "online");
     auth.searchParams.set("prompt", "select_account");
@@ -81,8 +81,13 @@ const server = http.createServer(async (req, res) => {
     const profile = await getJson("https://www.googleapis.com/oauth2/v3/userinfo", token.json.access_token);
     const user = { sub: profile.sub, name: profile.name, email: profile.email, picture: profile.picture };
     const packed = encodeURIComponent(JSON.stringify(user));
-    res.writeHead(302, { Location: "/#signed-in=" + packed });
-    res.end();
+    const access = {
+      accessToken: token.json.access_token,
+      expiresAt: Date.now() + (Number(token.json.expires_in) || 3600) * 1000,
+      sub: user.sub,
+    };
+    const page = "<!doctype html><meta charset=\"utf-8\"><title>Signing in</title><script>sessionStorage.setItem(\"school-tracker-access\"," + JSON.stringify(JSON.stringify(access)) + ");location.replace(" + JSON.stringify("/#signed-in=" + packed) + ");</script>";
+    send(res, 200, page, "text/html");
     return;
   }
   let filePath = decodeURIComponent(url.pathname);

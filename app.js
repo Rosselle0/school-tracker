@@ -2,6 +2,13 @@ const KEY = "school-tracker-v2";
 const SESSION = "school-tracker-session";
 const state = load();
 let openId = null;
+let booting = false;
+let needsConnect = false;
+let cloudNote = "";
+let cloudTimer = 0;
+let cloudGen = 0;
+const TOKEN_KEY = "school-tracker-access";
+const DRIVE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive.appdata";
 let dragId = null;
 let dragGroupId = null;
 
@@ -41,6 +48,7 @@ function blankTracker() {
     found: [],
     wallpaper: "",
     summersAdded: false,
+    updatedAt: 0,
   };
 }
 function accountKey(sub) {
@@ -72,30 +80,271 @@ function load() {
   if (!data.user || data.user.sub !== sub) return blankTracker();
   return data;
 }
-function save() {
+function save(options) {
   if (!state.user || !state.user.sub) {
     localStorage.removeItem(SESSION);
     return;
   }
+  if (!options || !options.keepStamp) state.updatedAt = Date.now();
   localStorage.setItem(SESSION, state.user.sub);
   localStorage.setItem(accountKey(state.user.sub), JSON.stringify(state));
+  if (!options || options.push !== false) scheduleCloud();
 }
-function adoptUser(user) {
-  const data = loadAccount(user.sub);
-  const next = Object.assign(blankTracker(), data, { user });
-  if (!next.university) next.step = "uni";
-  else if (!next.step || next.step === "login") next.step = "app";
-  Object.keys(state).forEach((key) => delete state[key]);
-  Object.assign(state, next);
+async function adoptUser(user) {
+  const local = Object.assign(blankTracker(), loadAccount(user.sub), { user: user });
   openId = null;
-  save();
+  booting = true;
+  replaceState(local);
+  render();
+  let remote = null;
+  try {
+    const cached = readAccess();
+    const token = cached && cached.sub === user.sub ? cached.accessToken : "";
+    if (!token) needsConnect = true;
+    if (token && window.SchoolSync) {
+      try {
+        remote = await SchoolSync.loadDocument(fetch, token);
+      } catch (error) {
+        cloudNote = error.message;
+      }
+    }
+    if (remote && remote.sub && remote.sub !== user.sub) remote = null;
+    const picked = window.SchoolSync ? SchoolSync.choose(local, remote) : (local.university ? { source: "local", doc: local } : null);
+    if (!picked) {
+      replaceState(Object.assign(blankTracker(), { user: user, step: "uni" }));
+      save({ push: false });
+    } else {
+      const next = window.SchoolSync
+        ? SchoolSync.applyDocument(picked.doc, user, local.wallpaper || "")
+        : Object.assign(blankTracker(), picked.doc, { user: user, step: "app" });
+      replaceState(next);
+      save({ push: picked.source === "local", keepStamp: picked.source !== "local" });
+    }
+  } finally {
+    booting = false;
+    render();
+  }
 }
 function resetTracker(user, step) {
   const next = Object.assign(blankTracker(), { user, step });
-  Object.keys(state).forEach((key) => delete state[key]);
-  Object.assign(state, next);
+  replaceState(next);
   openId = null;
   save();
+}
+function replaceState(next) {
+  Object.keys(state).forEach((key) => delete state[key]);
+  Object.assign(state, blankTracker(), next);
+}
+function readAccess() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(TOKEN_KEY) || "null");
+    if (!parsed || !parsed.accessToken || !parsed.expiresAt) return null;
+    if (parsed.expiresAt < Date.now() + 60000) return null;
+    if (state.user && parsed.sub && parsed.sub !== state.user.sub) return null;
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+}
+function writeAccess(accessToken, expiresIn, sub) {
+  sessionStorage.setItem(TOKEN_KEY, JSON.stringify({
+    accessToken: accessToken,
+    expiresAt: Date.now() + (Number(expiresIn) || 3600) * 1000,
+    sub: sub || (state.user && state.user.sub) || "",
+  }));
+}
+function clearAccess() {
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+function requestGoogleToken(prompt) {
+  return new Promise((resolve) => {
+    if (!window.google || !google.accounts || !google.accounts.oauth2 || !window.GOOGLE_CLIENT_ID) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: window.GOOGLE_CLIENT_ID,
+      scope: DRIVE_SCOPE,
+      hint: (state.user && state.user.email) || "",
+      callback: (resp) => {
+        if (!resp || resp.error || !resp.access_token) finish(null);
+        else finish({ accessToken: resp.access_token, expiresIn: resp.expires_in || 3600 });
+      },
+      error_callback: () => finish(null),
+    });
+    client.requestAccessToken({ prompt: prompt });
+  });
+}
+async function profileFromToken(token) {
+  const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: "Bearer " + token },
+  });
+  if (!response.ok) return null;
+  const profile = await response.json();
+  if (!profile || !profile.sub) return null;
+  return {
+    sub: profile.sub,
+    name: profile.name || "",
+    email: profile.email || "",
+    picture: profile.picture || "",
+  };
+}
+function scheduleCloud() {
+  if (!state.user || !state.user.sub || !window.SchoolSync) return;
+  if (!readAccess()) {
+    needsConnect = true;
+    return;
+  }
+  if (cloudTimer) clearTimeout(cloudTimer);
+  cloudTimer = setTimeout(() => {
+    cloudTimer = 0;
+    pushCloudNow();
+  }, 800);
+}
+async function pushCloudNow() {
+  const gen = cloudGen;
+  const cached = readAccess();
+  if (!cached || !state.user || !window.SchoolSync) return;
+  try {
+    await SchoolSync.saveDocument(fetch, cached.accessToken, SchoolSync.pack(state));
+    if (gen !== cloudGen) await SchoolSync.deleteDocument(fetch, cached.accessToken);
+  } catch (error) {
+    if (gen !== cloudGen) return;
+    cloudNote = error.message || "Couldn’t save online.";
+    if (error.status === 401) {
+      clearAccess();
+      needsConnect = true;
+    }
+  }
+}
+function waitForGoogle() {
+  return new Promise((resolve) => {
+    if (window.google && google.accounts && google.accounts.oauth2) {
+      resolve(true);
+      return;
+    }
+    let tries = 0;
+    const wait = setInterval(() => {
+      tries += 1;
+      if (window.google && google.accounts && google.accounts.oauth2) {
+        clearInterval(wait);
+        resolve(true);
+      } else if (tries > 50) {
+        clearInterval(wait);
+        resolve(false);
+      }
+    }, 100);
+  });
+}
+async function trySilentSync() {
+  if (!state.user || booting || !window.SchoolSync) return;
+  let token = "";
+  const cached = readAccess();
+  if (cached) token = cached.accessToken;
+  if (!token && !onThisComputer()) {
+    const ready = await waitForGoogle();
+    if (!state.user || booting) return;
+    if (ready) {
+      const got = await requestGoogleToken("");
+      if (!state.user || booting) return;
+      if (got) {
+        writeAccess(got.accessToken, got.expiresIn, state.user.sub);
+        token = got.accessToken;
+      }
+    }
+  }
+  if (!token) {
+    needsConnect = true;
+    render();
+    return;
+  }
+  needsConnect = false;
+  let remote = null;
+  try {
+    remote = await SchoolSync.loadDocument(fetch, token);
+  } catch (error) {
+    cloudNote = error.message;
+    render();
+    return;
+  }
+  if (!state.user || booting) return;
+  if (remote && remote.sub && remote.sub !== state.user.sub) remote = null;
+  const local = loadAccount(state.user.sub);
+  const picked = SchoolSync.choose(local, remote);
+  if (!picked) return;
+  if (picked.source === "remote") {
+    replaceState(SchoolSync.applyDocument(picked.doc, state.user, local.wallpaper || ""));
+    save({ push: false, keepStamp: true });
+    render();
+    return;
+  }
+  scheduleCloud();
+}
+function renderSyncBanner() {
+  if (!needsConnect && !cloudNote) return null;
+  const banner = el("div", "sync-banner");
+  banner.id = "sync-banner";
+  if (needsConnect) {
+    banner.append(el("p", "", "This board is only on this device until you connect it. The same Google account can then open it on your phone."));
+    const button = el("button", "primary", "Connect this account");
+    button.type = "button";
+    button.onclick = () => { connectAccount(); };
+    banner.append(button);
+  }
+  if (cloudNote) banner.append(el("p", "miss", cloudNote));
+  return banner;
+}
+function connectAccount() {
+  if (onThisComputer()) {
+    location.href = "/oauth/start";
+    return;
+  }
+  requestGoogleToken("consent").then(async (got) => {
+    if (!got) return;
+    const profile = await profileFromToken(got.accessToken);
+    if (!profile) {
+      cloudNote = "Google didn’t return an account. Try again.";
+      render();
+      return;
+    }
+    writeAccess(got.accessToken, got.expiresIn, profile.sub);
+    await adoptUser(profile);
+  });
+}
+async function deleteTrackerAccount() {
+  if (!window.confirm("Delete your tracker account? Your university, classes, notes, and wallpaper will be removed from every device. This does not delete your Google account.")) return;
+  if (cloudTimer) clearTimeout(cloudTimer);
+  cloudTimer = 0;
+  cloudGen += 1;
+  const cached = readAccess();
+  if (!cached) {
+    needsConnect = true;
+    cloudNote = "Connect this account first so the online copy can be deleted too.";
+    render();
+    return;
+  }
+  try {
+    await SchoolSync.deleteDocument(fetch, cached.accessToken);
+  } catch (error) {
+    cloudNote = "Couldn’t delete the online board. Nothing was removed.";
+    render();
+    return;
+  }
+  const sub = state.user && state.user.sub;
+  if (sub) localStorage.removeItem(accountKey(sub));
+  localStorage.removeItem(SESSION);
+  clearAccess();
+  openId = null;
+  needsConnect = false;
+  cloudNote = "";
+  replaceState(blankTracker());
+  render();
 }
 function uniByName(name) {
   return BRANDS.find((uni) => uni.name === name) || null;
@@ -220,6 +469,10 @@ function isConcordia(name) {
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = "";
+  if (booting) {
+    renderLoading(app);
+    return;
+  }
   if (!state.user) renderLogin(app);
   else if (!state.university || state.step === "uni") renderUni(app);
   else {
@@ -237,23 +490,39 @@ function render() {
 function onThisComputer() {
   return location.hostname === "127.0.0.1" || location.hostname === "localhost";
 }
-function profileFromCredential(credential) {
-  const parts = String(credential || "").split(".");
-  if (parts.length < 2) return null;
-  try {
-    const padded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const bytes = Uint8Array.from(atob(padded + "=".repeat((4 - (padded.length % 4)) % 4)), (char) => char.charCodeAt(0));
-    const profile = JSON.parse(new TextDecoder().decode(bytes));
-    if (!profile.sub) return null;
-    return {
-      sub: profile.sub,
-      name: profile.name || "",
-      email: profile.email || "",
-      picture: profile.picture || "",
-    };
-  } catch (error) {
-    return null;
-  }
+function googleButton(onClick) {
+  const btn = el("button", "google");
+  btn.type = "button";
+  const mark = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  mark.setAttribute("viewBox", "0 0 48 48");
+  mark.setAttribute("class", "gmark");
+  mark.innerHTML = '<path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3.1l5.7-5.7C34.2 6.1 29.4 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 12 24 12c3.1 0 5.8 1.2 8 3.1l5.7-5.7C34.2 6.1 29.4 4 24 4 16.3 4 9.6 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.3C29.3 35.1 26.8 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3.2-3.5 5.7-6.6 7.1l6.3 5.3C37.4 38.4 44 34 44 24c0-1.3-.1-2.7-.4-3.5z"/>';
+  btn.append(mark, document.createTextNode("Continue with Google"));
+  btn.onclick = onClick;
+  return btn;
+}
+function beginGoogleSignIn(note) {
+  note.textContent = "";
+  requestGoogleToken("select_account").then(async (got) => {
+    if (!got) {
+      note.textContent = "Google didn’t finish sign-in. Try again.";
+      return;
+    }
+    const profile = await profileFromToken(got.accessToken);
+    if (!profile) {
+      note.textContent = "Google didn’t return an account. Try again.";
+      return;
+    }
+    writeAccess(got.accessToken, got.expiresIn, profile.sub);
+    await adoptUser(profile);
+  });
+}
+function renderLoading(app) {
+  const scene = el("section", "scene");
+  scene.append(el("p", "kicker", "Your classes, with the real names"));
+  scene.append(el("h1", "", "School"));
+  scene.append(el("p", "sub", "Opening your board…"));
+  app.append(scene);
 }
 let googleWait = 0;
 function renderLogin(app) {
@@ -262,20 +531,12 @@ function renderLogin(app) {
   const scene = el("section", "scene");
   scene.append(el("p", "kicker", "Your classes, with the real names"));
   scene.append(el("h1", "", "School"));
-  scene.append(el("p", "sub", "Sign in with Google. Then tell it your university and the codes you can never remember."));
-  const note = el("p", "miss", "");
+  scene.append(el("p", "sub", "Sign in with Google. Your university and classes come with this account, on your phone and on another computer."));
+  const note = el("p", "miss", cloudNote);
   if (onThisComputer()) {
-    const btn = el("button", "google");
-    btn.type = "button";
-    const mark = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    mark.setAttribute("viewBox", "0 0 48 48");
-    mark.setAttribute("class", "gmark");
-    mark.innerHTML = '<path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3.1l5.7-5.7C34.2 6.1 29.4 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 12 24 12c3.1 0 5.8 1.2 8 3.1l5.7-5.7C34.2 6.1 29.4 4 24 4 16.3 4 9.6 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 10-2 13.6-5.2l-6.3-5.3C29.3 35.1 26.8 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3.2-3.5 5.7-6.6 7.1l6.3 5.3C37.4 38.4 44 34 44 24c0-1.3-.1-2.7-.4-3.5z"/>';
-    btn.append(mark, document.createTextNode("Continue with Google"));
-    btn.onclick = () => {
+    scene.append(googleButton(() => {
       location.href = "/oauth/start";
-    };
-    scene.append(btn);
+    }));
   } else {
     const slot = el("div", "google-slot");
     scene.append(slot);
@@ -283,30 +544,8 @@ function renderLogin(app) {
       note.textContent = "Google sign-in isn’t configured on this site.";
     } else {
       const mount = () => {
-        if (!window.google || !google.accounts || !google.accounts.id) return false;
-        google.accounts.id.initialize({
-          client_id: window.GOOGLE_CLIENT_ID,
-          callback: (response) => {
-            const profile = profileFromCredential(response && response.credential);
-            if (!profile) {
-              note.textContent = "Google didn’t return an account. Try again.";
-              return;
-            }
-            adoptUser(profile);
-            render();
-          },
-          auto_select: false,
-          cancel_on_tap_outside: true,
-        });
-        slot.innerHTML = "";
-        google.accounts.id.renderButton(slot, {
-          type: "standard",
-          theme: "outline",
-          size: "large",
-          text: "continue_with",
-          shape: "pill",
-          width: 280,
-        });
+        if (!window.google || !google.accounts || !google.accounts.oauth2) return false;
+        slot.replaceChildren(googleButton(() => beginGoogleSignIn(note)));
         return true;
       };
       if (!mount()) {
@@ -328,6 +567,8 @@ function renderLogin(app) {
 
 function renderUni(app) {
   const scene = el("section", "scene");
+  const banner = renderSyncBanner();
+  if (banner) scene.append(banner);
   scene.append(el("p", "kicker", "Hey " + (state.user.name || "").split(" ")[0]));
   scene.append(el("h2", "ask", "What university are you in?"));
   scene.append(el("p", "sub", "Type the school name, then pick it from the list."));
@@ -638,7 +879,10 @@ function renderApp(app) {
   else if (page === "codes") renderCodes(main);
   else if (page === "settings") renderSettings(main);
   else renderBoard(main);
-  shell.append(bar, backdrop, nav, main);
+  shell.append(bar, backdrop, nav);
+  const banner = renderSyncBanner();
+  if (banner) shell.append(banner);
+  shell.append(main);
   app.append(shell);
 }
 
@@ -680,6 +924,9 @@ function renderNav() {
     state.step = "login";
     state.university = "";
     openId = null;
+    needsConnect = false;
+    cloudNote = "";
+    clearAccess();
     localStorage.removeItem(SESSION);
     render();
   };
@@ -857,7 +1104,7 @@ let wallpaperNote = "";
 function renderSettings(main) {
   const scene = el("section", "scene");
   scene.append(el("h2", "ask", "Settings"));
-  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". This account’s classes stay separate from anyone else who signs in here."));
+  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". This Google account opens the same board on every device, separate from anyone else."));
   scene.append(el("h3", "term-label", "Wallpaper"));
   scene.append(el("p", "miss", "A picture from this phone or computer, sitting quietly behind the pages."));
   const pick = el("label", "drop");
@@ -921,16 +1168,11 @@ function renderSettings(main) {
   const row = el("div", "row");
   row.append(switchBtn);
   scene.append(row);
-  scene.append(el("h3", "term-label", "Start over"));
-  scene.append(el("p", "miss", "Delete this account’s saved tracker. You stay able to sign in with Google, and the university question comes back empty. It does not delete the Google account."));
-  const wipe = el("button", "ghost", "Delete this tracker");
-  wipe.onclick = () => {
-    if (!window.confirm("Delete everything saved for this account?")) return;
-    const sub = state.user && state.user.sub;
-    const user = state.user;
-    if (sub) localStorage.removeItem(accountKey(sub));
-    resetTracker(user, "uni");
-  };
+  scene.append(el("h3", "term-label", "Delete tracker account"));
+  scene.append(el("p", "miss", "This removes your university, classes, notes, and wallpaper from every phone and computer signed in with this Google account. It does not delete the Google account."));
+  const wipe = el("button", "danger", "Delete tracker account");
+  wipe.type = "button";
+  wipe.onclick = () => { deleteTrackerAccount(); };
   scene.append(wipe);
   main.append(scene);
 }
@@ -1245,12 +1487,17 @@ function coachMessage(course) {
   return "You’re in " + course.code + " and the leftover list is empty. Add the labs or the final.";
 }
 
+let bootPromise = null;
 if (location.hash.startsWith("#signed-in=")) {
   try {
-    adoptUser(JSON.parse(decodeURIComponent(location.hash.slice("#signed-in=".length))));
+    const signedInUser = JSON.parse(decodeURIComponent(location.hash.slice("#signed-in=".length)));
+    history.replaceState(null, "", location.pathname + location.search);
+    bootPromise = adoptUser(signedInUser);
   } catch (error) {
     console.error(error);
   }
-  history.replaceState(null, "", location.pathname);
 }
-render();
+if (!bootPromise) {
+  render();
+  if (state.user) trySilentSync();
+}
