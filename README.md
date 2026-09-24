@@ -1,7 +1,7 @@
-# School tracker
+# School
 
-Personal Computer Engineering tracker for the Concordia 2026–27 sequence.
+A board for the classes you still have. Open the site, sign in with Google, pick your school, and add classes by code or by dropping a picture or PDF.
 
-Open `index.html` in a browser. Progress, notes, and the coach stay in that browser on this computer.
+Each person’s classes stay in that browser, on that phone or computer. It is not a shared class list. A friend who opens the same link starts with their own empty board.
 
-Pick the sequence that matches you (COOP fall, regular fall, regular winter, or accelerated). Mark each class not started, doing, or done. The two natural science electives are at the top.
+https://rosselle0.github.io/school-tracker/
