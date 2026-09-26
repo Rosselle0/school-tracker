@@ -8,7 +8,7 @@ let cloudNote = "";
 let cloudTimer = 0;
 let cloudGen = 0;
 const TOKEN_KEY = "school-tracker-access";
-const DRIVE_SCOPE = "openid email profile https://www.googleapis.com/auth/drive.appdata";
+const AUTH_SCOPE = "openid email profile";
 let dragId = null;
 let dragGroupId = null;
 
@@ -96,30 +96,14 @@ async function adoptUser(user) {
   booting = true;
   replaceState(local);
   render();
-  let remote = null;
   try {
-    const cached = readAccess();
-    const token = cached && cached.sub === user.sub ? cached.accessToken : "";
-    if (!token) needsConnect = true;
-    if (token && window.SchoolSync) {
-      try {
-        remote = await SchoolSync.loadDocument(fetch, token);
-      } catch (error) {
-        cloudNote = error.message;
-      }
-    }
-    if (remote && remote.sub && remote.sub !== user.sub) remote = null;
-    const picked = window.SchoolSync ? SchoolSync.choose(local, remote) : (local.university ? { source: "local", doc: local } : null);
-    if (!picked) {
+    if (!local.university) {
       replaceState(Object.assign(blankTracker(), { user: user, step: "uni" }));
-      save({ push: false });
     } else {
-      const next = window.SchoolSync
-        ? SchoolSync.applyDocument(picked.doc, user, local.wallpaper || "")
-        : Object.assign(blankTracker(), picked.doc, { user: user, step: "app" });
-      replaceState(next);
-      save({ push: picked.source === "local", keepStamp: picked.source !== "local" });
+      replaceState(Object.assign(blankTracker(), local, { user: user, step: "app" }));
     }
+    needsConnect = false;
+    save({ push: false, keepStamp: true });
   } finally {
     booting = false;
     render();
@@ -170,7 +154,7 @@ function requestGoogleToken(prompt) {
     };
     const client = google.accounts.oauth2.initTokenClient({
       client_id: window.GOOGLE_CLIENT_ID,
-      scope: DRIVE_SCOPE,
+      scope: AUTH_SCOPE,
       hint: (state.user && state.user.email) || "",
       callback: (resp) => {
         if (!resp || resp.error || !resp.access_token) finish(null);
@@ -196,32 +180,10 @@ async function profileFromToken(token) {
   };
 }
 function scheduleCloud() {
-  if (!state.user || !state.user.sub || !window.SchoolSync) return;
-  if (!readAccess()) {
-    needsConnect = true;
-    return;
-  }
-  if (cloudTimer) clearTimeout(cloudTimer);
-  cloudTimer = setTimeout(() => {
-    cloudTimer = 0;
-    pushCloudNow();
-  }, 800);
+  return;
 }
 async function pushCloudNow() {
-  const gen = cloudGen;
-  const cached = readAccess();
-  if (!cached || !state.user || !window.SchoolSync) return;
-  try {
-    await SchoolSync.saveDocument(fetch, cached.accessToken, SchoolSync.pack(state));
-    if (gen !== cloudGen) await SchoolSync.deleteDocument(fetch, cached.accessToken);
-  } catch (error) {
-    if (gen !== cloudGen) return;
-    cloudNote = error.message || "Couldn’t save online.";
-    if (error.status === 401) {
-      clearAccess();
-      needsConnect = true;
-    }
-  }
+  return;
 }
 function waitForGoogle() {
   return new Promise((resolve) => {
@@ -243,99 +205,16 @@ function waitForGoogle() {
   });
 }
 async function trySilentSync() {
-  if (!state.user || booting || !window.SchoolSync) return;
-  let token = "";
-  const cached = readAccess();
-  if (cached) token = cached.accessToken;
-  if (!token && !onThisComputer()) {
-    const ready = await waitForGoogle();
-    if (!state.user || booting) return;
-    if (ready) {
-      const got = await requestGoogleToken("");
-      if (!state.user || booting) return;
-      if (got) {
-        writeAccess(got.accessToken, got.expiresIn, state.user.sub);
-        token = got.accessToken;
-      }
-    }
-  }
-  if (!token) {
-    needsConnect = true;
-    render();
-    return;
-  }
-  needsConnect = false;
-  let remote = null;
-  try {
-    remote = await SchoolSync.loadDocument(fetch, token);
-  } catch (error) {
-    cloudNote = error.message;
-    render();
-    return;
-  }
-  if (!state.user || booting) return;
-  if (remote && remote.sub && remote.sub !== state.user.sub) remote = null;
-  const local = loadAccount(state.user.sub);
-  const picked = SchoolSync.choose(local, remote);
-  if (!picked) return;
-  if (picked.source === "remote") {
-    replaceState(SchoolSync.applyDocument(picked.doc, state.user, local.wallpaper || ""));
-    save({ push: false, keepStamp: true });
-    render();
-    return;
-  }
-  scheduleCloud();
+  return;
 }
 function renderSyncBanner() {
-  if (!needsConnect && !cloudNote) return null;
-  const banner = el("div", "sync-banner");
-  banner.id = "sync-banner";
-  if (needsConnect) {
-    banner.append(el("p", "", "This board is only on this device until you connect it. The same Google account can then open it on your phone."));
-    const button = el("button", "primary", "Connect this account");
-    button.type = "button";
-    button.onclick = () => { connectAccount(); };
-    banner.append(button);
-  }
-  if (cloudNote) banner.append(el("p", "miss", cloudNote));
-  return banner;
-}
-function connectAccount() {
-  if (onThisComputer()) {
-    location.href = "/oauth/start";
-    return;
-  }
-  requestGoogleToken("consent").then(async (got) => {
-    if (!got) return;
-    const profile = await profileFromToken(got.accessToken);
-    if (!profile) {
-      cloudNote = "Google didn’t return an account. Try again.";
-      render();
-      return;
-    }
-    writeAccess(got.accessToken, got.expiresIn, profile.sub);
-    await adoptUser(profile);
-  });
+  return null;
 }
 async function deleteTrackerAccount() {
-  if (!window.confirm("Delete your tracker account? Your university, classes, notes, and wallpaper will be removed from every device. This does not delete your Google account.")) return;
+  if (!window.confirm("Delete your tracker account? Your university, classes, notes, and wallpaper on this browser will be removed. This does not delete your Google account.")) return;
   if (cloudTimer) clearTimeout(cloudTimer);
   cloudTimer = 0;
   cloudGen += 1;
-  const cached = readAccess();
-  if (!cached) {
-    needsConnect = true;
-    cloudNote = "Connect this account first so the online copy can be deleted too.";
-    render();
-    return;
-  }
-  try {
-    await SchoolSync.deleteDocument(fetch, cached.accessToken);
-  } catch (error) {
-    cloudNote = "Couldn’t delete the online board. Nothing was removed.";
-    render();
-    return;
-  }
   const sub = state.user && state.user.sub;
   if (sub) localStorage.removeItem(accountKey(sub));
   localStorage.removeItem(SESSION);
@@ -531,7 +410,7 @@ function renderLogin(app) {
   const scene = el("section", "scene");
   scene.append(el("p", "kicker", "Your classes, with the real names"));
   scene.append(el("h1", "", "School"));
-  scene.append(el("p", "sub", "Sign in with Google. Your university and classes come with this account, on your phone and on another computer."));
+  scene.append(el("p", "sub", "Sign in with Google. Your university and classes stay in this browser."));
   const note = el("p", "miss", cloudNote);
   if (onThisComputer()) {
     scene.append(googleButton(() => {
@@ -1104,7 +983,7 @@ let wallpaperNote = "";
 function renderSettings(main) {
   const scene = el("section", "scene");
   scene.append(el("h2", "ask", "Settings"));
-  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". This Google account opens the same board on every device, separate from anyone else."));
+  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". Classes stay in this browser."));
   scene.append(el("h3", "term-label", "Wallpaper"));
   scene.append(el("p", "miss", "A picture from this phone or computer, sitting quietly behind the pages."));
   const pick = el("label", "drop");
@@ -1169,7 +1048,7 @@ function renderSettings(main) {
   row.append(switchBtn);
   scene.append(row);
   scene.append(el("h3", "term-label", "Delete tracker account"));
-  scene.append(el("p", "miss", "This removes your university, classes, notes, and wallpaper from every phone and computer signed in with this Google account. It does not delete the Google account."));
+  scene.append(el("p", "miss", "This removes your university, classes, notes, and wallpaper from this browser. It does not delete the Google account."));
   const wipe = el("button", "danger", "Delete tracker account");
   wipe.type = "button";
   wipe.onclick = () => { deleteTrackerAccount(); };
@@ -1189,15 +1068,8 @@ function coursesInOrder() {
 }
 
 function renderBoard(app) {
-  const uni = uniByName(state.university);
   const bar = el("header", "topbar");
-  const title = el("div", "board-brand");
-  title.append(uniMark(state.university));
-  const heading = el("h2", "ask uni-title", state.university);
-  heading.style.fontFamily = (uni ? uni.font : "Fraunces") + ", Georgia, serif";
-  heading.style.fontSize = "34px";
-  title.append(heading);
-  bar.append(title);
+  bar.append(el("h2", "page-title", "Board"));
   const hint = el("p", "hint board-hint", "Drag a term by the grip to reorder it. Summers sit with the other terms.");
   app.append(bar, hint);
   const board = el("div", "board");
@@ -1210,7 +1082,7 @@ function renderBoard(app) {
     state.pending = [];
     go("codes");
   };
-  const tools = el("div", "group");
+  const tools = el("div", "group board-tools");
   tools.append(fromFile, addClass);
   board.append(tools);
   app.append(board);

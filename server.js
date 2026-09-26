@@ -52,7 +52,7 @@ const server = http.createServer(async (req, res) => {
     auth.searchParams.set("client_id", secrets.clientId);
     auth.searchParams.set("redirect_uri", redirectUri);
     auth.searchParams.set("response_type", "code");
-    auth.searchParams.set("scope", "openid email profile https://www.googleapis.com/auth/drive.appdata");
+    auth.searchParams.set("scope", "openid email profile");
     auth.searchParams.set("state", state);
     auth.searchParams.set("access_type", "online");
     auth.searchParams.set("prompt", "select_account");
