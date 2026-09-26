@@ -6,8 +6,12 @@ let booting = false;
 let needsConnect = false;
 let cloudNote = "";
 let cloudTimer = 0;
-let cloudGen = 0;
+let cloudFlight = null;
+let cloudAgain = false;
+let wiping = false;
 const TOKEN_KEY = "school-tracker-access";
+const FIREBASE_KEY = "school-tracker-firebase";
+const REFRESH_PREFIX = "school-tracker-refresh:";
 const AUTH_SCOPE = "openid email profile";
 let dragId = null;
 let dragGroupId = null;
@@ -90,20 +94,43 @@ function save(options) {
   localStorage.setItem(accountKey(state.user.sub), JSON.stringify(state));
   if (!options || options.push !== false) scheduleCloud();
 }
+function settleLocal(local, user) {
+  if (!local.university) replaceState(Object.assign(blankTracker(), { user: user, step: "uni" }));
+  else replaceState(Object.assign(blankTracker(), local, { user: user, step: "app" }));
+  save({ push: false, keepStamp: true });
+}
 async function adoptUser(user) {
+  if (cloudTimer) clearTimeout(cloudTimer);
+  cloudTimer = 0;
+  cloudAgain = false;
+  if (cloudFlight) {
+    try { await cloudFlight; } catch (error) { /* keep going with a cloud load */ }
+  }
   const local = Object.assign(blankTracker(), loadAccount(user.sub), { user: user });
   openId = null;
   booting = true;
+  needsConnect = false;
+  cloudNote = "Opening your saved board…";
   replaceState(local);
   render();
   try {
-    if (!local.university) {
-      replaceState(Object.assign(blankTracker(), { user: user, step: "uni" }));
-    } else {
-      replaceState(Object.assign(blankTracker(), local, { user: user, step: "app" }));
+    if (!firebaseConfigured()) {
+      cloudNote = "Sync isn’t set up on this site yet. Your board is still on this device.";
+      settleLocal(local, user);
+      return;
     }
+    const idToken = await ensureFirebaseToken(user.sub);
+    if (!idToken) {
+      needsConnect = true;
+      cloudNote = "Sign in again to sync this board.";
+      settleLocal(local, user);
+      return;
+    }
+    await reconcile(user, local, idToken);
+  } catch (error) {
     needsConnect = false;
-    save({ push: false, keepStamp: true });
+    cloudNote = (error && error.message) || "Couldn’t open the saved board. This device is unchanged.";
+    settleLocal(local, user);
   } finally {
     booting = false;
     render();
@@ -139,6 +166,147 @@ function writeAccess(accessToken, expiresIn, sub) {
 }
 function clearAccess() {
   sessionStorage.removeItem(TOKEN_KEY);
+}
+function refreshKey(sub) {
+  return REFRESH_PREFIX + sub;
+}
+function clearCloudSession(sub) {
+  clearAccess();
+  sessionStorage.removeItem(FIREBASE_KEY);
+  if (sub) localStorage.removeItem(refreshKey(sub));
+}
+function firebaseConfigured() {
+  return !!(window.FIREBASE_API_KEY && window.FIREBASE_PROJECT_ID && window.SchoolSync);
+}
+function readFirebase(sub) {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(FIREBASE_KEY) || "null");
+    if (!parsed || parsed.sub !== sub || !parsed.idToken) return null;
+    if (parsed.expiresAt < Date.now() + 60000) return null;
+    return parsed.idToken;
+  } catch (error) {
+    return null;
+  }
+}
+function storeFirebase(sub, idToken, expiresIn, refreshToken) {
+  sessionStorage.setItem(FIREBASE_KEY, JSON.stringify({
+    sub: sub,
+    idToken: idToken,
+    expiresAt: Date.now() + (Number(expiresIn) || 3600) * 1000,
+  }));
+  if (refreshToken) localStorage.setItem(refreshKey(sub), refreshToken);
+}
+async function exchangeGoogleAccess(accessToken, sub) {
+  if (!firebaseConfigured() || !accessToken || !sub) return null;
+  const response = await fetch(
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=" + encodeURIComponent(window.FIREBASE_API_KEY),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        postBody: "access_token=" + encodeURIComponent(accessToken) + "&providerId=google.com",
+        requestUri: location.origin,
+        returnSecureToken: true,
+      }),
+    }
+  );
+  const json = await response.json().catch(() => null);
+  if (!response.ok || !json || !json.idToken) return null;
+  storeFirebase(sub, json.idToken, json.expiresIn, json.refreshToken);
+  return json.idToken;
+}
+async function refreshFirebase(sub) {
+  const refreshToken = localStorage.getItem(refreshKey(sub));
+  if (!refreshToken || !firebaseConfigured()) return null;
+  const response = await fetch(
+    "https://securetoken.googleapis.com/v1/token?key=" + encodeURIComponent(window.FIREBASE_API_KEY),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }).toString(),
+    }
+  );
+  const json = await response.json().catch(() => null);
+  if (!response.ok || !json || !json.id_token) {
+    localStorage.removeItem(refreshKey(sub));
+    return null;
+  }
+  storeFirebase(sub, json.id_token, json.expires_in, json.refresh_token || refreshToken);
+  return json.id_token;
+}
+async function ensureFirebaseToken(sub, options) {
+  if (!firebaseConfigured() || !sub) return null;
+  const cached = readFirebase(sub);
+  if (cached) return cached;
+  const refreshed = await refreshFirebase(sub);
+  if (refreshed) return refreshed;
+  const access = readAccess();
+  if (access && access.accessToken && access.sub === sub) {
+    const exchanged = await exchangeGoogleAccess(access.accessToken, sub);
+    if (exchanged) return exchanged;
+  }
+  if (options && options.silent) {
+    const got = await requestGoogleToken("");
+    if (!got) return null;
+    const profile = await profileFromToken(got.accessToken);
+    if (!profile || profile.sub !== sub) return null;
+    writeAccess(got.accessToken, got.expiresIn, profile.sub);
+    return exchangeGoogleAccess(got.accessToken, sub);
+  }
+  return null;
+}
+function recompressDataUrl(dataUrl, max, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => reject(new Error("image"));
+    img.src = dataUrl;
+  });
+}
+async function packForCloud(source) {
+  const sync = window.SchoolSync;
+  let current = source;
+  if (source && source.wallpaper && sync.byteLength(source.wallpaper) > 700000) {
+    try {
+      current = Object.assign({}, source, { wallpaper: await recompressDataUrl(source.wallpaper, 1600, 0.7) });
+    } catch (error) {
+      current = source;
+    }
+  }
+  let packed = sync.pack(current);
+  if (packed.wallpaperSkipped && source && source.wallpaper) {
+    try {
+      const smaller = await recompressDataUrl(source.wallpaper, 1000, 0.55);
+      packed = sync.pack(Object.assign({}, source, { wallpaper: smaller }));
+    } catch (error) { /* the stripped pack still has the classes */ }
+  }
+  return packed;
+}
+async function reconcile(user, local, idToken) {
+  const remote = await window.SchoolSync.loadDocument(fetch, idToken, user.sub);
+  const decision = window.SchoolSync.merge(local, remote, user);
+  replaceState(decision.state);
+  if (!decision.upload) {
+    save({ push: false, keepStamp: true });
+    needsConnect = false;
+    cloudNote = remote ? "Opened the saved board." : "";
+    return;
+  }
+  const packed = await packForCloud(decision.state);
+  const written = await window.SchoolSync.saveDocument(fetch, idToken, packed);
+  if (written && written.updatedAt) state.updatedAt = written.updatedAt;
+  save({ push: false, keepStamp: true });
+  needsConnect = false;
+  cloudNote = written && written.wallpaperSkipped && decision.state.wallpaper
+    ? "Saved your classes. The picture was too big to sync."
+    : "Saved to your Google account.";
 }
 function requestGoogleToken(prompt) {
   return new Promise((resolve) => {
@@ -180,10 +348,59 @@ async function profileFromToken(token) {
   };
 }
 function scheduleCloud() {
-  return;
+  if (booting || wiping || !state.user) return;
+  if (cloudTimer) clearTimeout(cloudTimer);
+  cloudTimer = setTimeout(() => {
+    cloudTimer = 0;
+    pushCloudNow();
+  }, 800);
 }
 async function pushCloudNow() {
-  return;
+  if (booting || wiping || !state.user || !state.user.sub) return;
+  if (cloudFlight) {
+    cloudAgain = true;
+    return;
+  }
+  const sub = state.user.sub;
+  const snapshot = JSON.parse(JSON.stringify(state));
+  cloudNote = "Saving your board…";
+  paintCloudNote();
+  cloudFlight = (async () => {
+    if (!firebaseConfigured()) {
+      cloudNote = "Sync isn’t set up on this site yet. Your board is still on this device.";
+      return;
+    }
+    const idToken = await ensureFirebaseToken(sub);
+    if (!state.user || state.user.sub !== sub) return;
+    if (!idToken) {
+      needsConnect = true;
+      cloudNote = "Sign in again to sync this board.";
+      return;
+    }
+    const packed = await packForCloud(snapshot);
+    const written = await window.SchoolSync.saveDocument(fetch, idToken, packed);
+    if (!state.user || state.user.sub !== sub) return;
+    needsConnect = false;
+    cloudNote = written && written.wallpaperSkipped && snapshot.wallpaper
+      ? "Saved your classes. The picture was too big to sync."
+      : "Saved to your Google account.";
+  })();
+  try {
+    await cloudFlight;
+  } catch (error) {
+    if (state.user && state.user.sub === sub) {
+      cloudNote = (error && error.message) || "Couldn’t save to your account. Your latest changes are still on this device.";
+    }
+  } finally {
+    cloudFlight = null;
+    paintCloudNote();
+    if (cloudAgain && !wiping && state.user && state.user.sub === sub && !booting) {
+      cloudAgain = false;
+      pushCloudNow();
+    } else {
+      cloudAgain = false;
+    }
+  }
 }
 function waitForGoogle() {
   return new Promise((resolve) => {
@@ -205,23 +422,109 @@ function waitForGoogle() {
   });
 }
 async function trySilentSync() {
-  return;
+  if (!state.user || !state.user.sub) return;
+  const local = JSON.parse(JSON.stringify(state));
+  booting = true;
+  cloudNote = "Opening your saved board…";
+  render();
+  try {
+    if (!firebaseConfigured()) {
+      cloudNote = "";
+      return;
+    }
+    const idToken = await ensureFirebaseToken(state.user.sub, { silent: true });
+    if (!idToken) {
+      needsConnect = true;
+      cloudNote = "Sign in again to sync this board.";
+      return;
+    }
+    await reconcile(state.user, local, idToken);
+  } catch (error) {
+    cloudNote = (error && error.message) || "Couldn’t open the saved board. This device is unchanged.";
+    replaceState(local);
+    save({ push: false, keepStamp: true });
+  } finally {
+    booting = false;
+    render();
+  }
 }
 function renderSyncBanner() {
-  return null;
+  const banner = el("div", "sync-banner");
+  const text = el("span", "", cloudNote);
+  text.id = "cloud-note";
+  banner.append(text);
+  if (!cloudNote && !needsConnect) banner.hidden = true;
+  if (needsConnect) {
+    const button = el("button", "primary", "Sync");
+    button.type = "button";
+    button.onclick = () => beginGoogleSignIn(text);
+    banner.append(button);
+    banner.hidden = false;
+  }
+  return banner;
+}
+function paintCloudNote() {
+  const node = document.getElementById("cloud-note");
+  if (!node) return;
+  node.textContent = cloudNote;
+  const banner = node.closest(".sync-banner");
+  if (banner) banner.hidden = !cloudNote && !needsConnect;
 }
 async function deleteTrackerAccount() {
-  if (!window.confirm("Delete your tracker account? Your university, classes, notes, and wallpaper on this browser will be removed. This does not delete your Google account.")) return;
+  if (!window.confirm("Delete your tracker account? Your university, classes, notes, and wallpaper are removed from this browser and from the saved copy. This does not delete your Google account.")) return;
+  wiping = true;
   if (cloudTimer) clearTimeout(cloudTimer);
   cloudTimer = 0;
-  cloudGen += 1;
+  cloudAgain = false;
   const sub = state.user && state.user.sub;
+  const user = state.user;
+  booting = true;
+  cloudNote = "Deleting the saved board…";
+  render();
+  let failed = false;
+  try {
+    if (cloudFlight) {
+      try { await cloudFlight; } catch (error) { /* delete replaces that save */ }
+    }
+    let idToken = sub ? await ensureFirebaseToken(sub, { silent: true }) : null;
+    if (sub && !idToken) {
+      const got = await requestGoogleToken("select_account");
+      if (got) {
+        const profile = await profileFromToken(got.accessToken);
+        if (profile && profile.sub === sub) {
+          writeAccess(got.accessToken, got.expiresIn, profile.sub);
+          idToken = await exchangeGoogleAccess(got.accessToken, sub);
+        }
+      }
+    }
+    if (sub && firebaseConfigured() && !idToken) {
+      failed = true;
+      needsConnect = true;
+      cloudNote = "Sign in again to delete the saved board.";
+      replaceState(Object.assign(blankTracker(), loadAccount(sub), { user: user, step: user && loadAccount(sub).university ? "app" : "uni" }));
+      return;
+    }
+    if (sub && idToken) await window.SchoolSync.deleteDocument(fetch, idToken, sub);
+  } catch (error) {
+    failed = true;
+    needsConnect = false;
+    cloudNote = "Couldn’t delete the saved board. Nothing was removed.";
+    if (sub) replaceState(Object.assign(blankTracker(), loadAccount(sub), { user: user, step: "app" }));
+    return;
+  } finally {
+    booting = false;
+    if (failed) {
+      wiping = false;
+      render();
+    }
+  }
   if (sub) localStorage.removeItem(accountKey(sub));
   localStorage.removeItem(SESSION);
-  clearAccess();
+  clearCloudSession(sub);
   openId = null;
   needsConnect = false;
   cloudNote = "";
+  wiping = false;
   replaceState(blankTracker());
   render();
 }
@@ -400,7 +703,7 @@ function renderLoading(app) {
   const scene = el("section", "scene");
   scene.append(el("p", "kicker", "Your classes, with the real names"));
   scene.append(el("h1", "", "School"));
-  scene.append(el("p", "sub", "Opening your board…"));
+  scene.append(el("p", "sub", cloudNote || "Opening your board…"));
   app.append(scene);
 }
 let googleWait = 0;
@@ -410,7 +713,7 @@ function renderLogin(app) {
   const scene = el("section", "scene");
   scene.append(el("p", "kicker", "Your classes, with the real names"));
   scene.append(el("h1", "", "School"));
-  scene.append(el("p", "sub", "Sign in with Google. Your university and classes stay in this browser."));
+  scene.append(el("p", "sub", "Sign in with Google. Your university, classes, and wallpaper sync to this account."));
   const note = el("p", "miss", cloudNote);
   if (onThisComputer()) {
     scene.append(googleButton(() => {
@@ -799,13 +1102,14 @@ function renderNav() {
   foot.append(el("span", "", state.user.name || state.user.email));
   const out = el("button", "ghost", "Sign out");
   out.onclick = () => {
+    const sub = state.user && state.user.sub;
     state.user = null;
     state.step = "login";
     state.university = "";
     openId = null;
     needsConnect = false;
     cloudNote = "";
-    clearAccess();
+    clearCloudSession(sub);
     localStorage.removeItem(SESSION);
     render();
   };
@@ -947,7 +1251,7 @@ function shrinkImage(file) {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      const max = 1400;
+      const max = 1600;
       const scale = Math.min(1, max / Math.max(img.width, img.height));
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.round(img.width * scale));
@@ -983,9 +1287,9 @@ let wallpaperNote = "";
 function renderSettings(main) {
   const scene = el("section", "scene");
   scene.append(el("h2", "ask", "Settings"));
-  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". Classes stay in this browser."));
+  scene.append(el("p", "sub", "Signed in as " + (state.user.email || state.user.name || "this Google account") + ". This account keeps the same board on your phone and computer."));
   scene.append(el("h3", "term-label", "Wallpaper"));
-  scene.append(el("p", "miss", "A picture from this phone or computer, sitting quietly behind the pages."));
+  scene.append(el("p", "miss", "A picture from this phone or computer, behind the pages on every device signed in to this account."));
   const pick = el("label", "drop");
   pick.append(el("span", "", state.wallpaper ? "Change picture" : "Choose a picture"));
   const file = document.createElement("input");
@@ -1048,7 +1352,7 @@ function renderSettings(main) {
   row.append(switchBtn);
   scene.append(row);
   scene.append(el("h3", "term-label", "Delete tracker account"));
-  scene.append(el("p", "miss", "This removes your university, classes, notes, and wallpaper from this browser. It does not delete the Google account."));
+  scene.append(el("p", "miss", "This removes your university, classes, notes, and wallpaper from this browser and from the saved copy for this Google account. It does not delete the Google account."));
   const wipe = el("button", "danger", "Delete tracker account");
   wipe.type = "button";
   wipe.onclick = () => { deleteTrackerAccount(); };
@@ -1370,6 +1674,6 @@ if (location.hash.startsWith("#signed-in=")) {
   }
 }
 if (!bootPromise) {
-  render();
   if (state.user) trySilentSync();
+  else render();
 }
